@@ -1,0 +1,388 @@
+// Prisma Schema for AI Interview Simulator
+// Approved baseline: Neon PostgreSQL + Prisma ORM + Better Auth
+// Documentation references: ARCHITECTURE.md, DECISIONS.md, SECURITY_PRIVACY.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Better Auth Core Models
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Better Auth relations
+  sessions      Session[]
+  accounts      Account[]
+
+  // Application relations
+  consent       UserConsent?
+  consentLogs   ConsentAuditLog[]
+  interviews    Interview[]
+  reports       InterviewReport[]
+  idempotencyKeys IdempotencyKey[]
+  usageRecords  UsageRecord[]
+  personalizationProfile PersonalizationProfile?
+
+  @@map("user")
+
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String    @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime? @default(now())
+  updatedAt  DateTime? @updatedAt
+
+  @@unique([identifier, value])
+  @@map("verification")
+}
+
+// -----------------------------------------------------------------------------
+// User Consent & Privacy Preferences (SECURITY_PRIVACY.md)
+// -----------------------------------------------------------------------------
+
+model UserConsent {
+  id                       String   @id @default(cuid())
+  userId                   String   @unique
+  user                     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Purpose-specific consent states with safe defaults
+  consentAiQuestions       Boolean  @default(false) // Purpose 1: AI Question Generation
+  consentAiEvaluation      Boolean  @default(false) // Purpose 2: AI Answer Evaluation & Reports
+  consentResumeProcessing  Boolean  @default(false) // Purpose 3: Current Resume Extraction
+  consentSavedResume       Boolean  @default(false) // Purpose 4: Persistent Saved Resume (Opt-in)
+  consentPersonalization   Boolean  @default(false) // Purpose 5: Historical Data Personalization (Opt-in)
+
+  noticeVersion            String   @default("1.0")
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@map("user_consent")
+}
+
+model ConsentAuditLog {
+  id            String        @id @default(cuid())
+  userId        String?
+  user          User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestSessionId String?
+  guestSession  GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+
+  purpose       String   // e.g. "ai_questions", "saved_resume", "personalization"
+  action        String   // "granted" | "withdrawn"
+  noticeVersion String   // e.g. "1.0"
+  timestamp     DateTime @default(now())
+  ipAddress     String?
+  userAgent     String?
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([purpose, timestamp])
+  @@map("consent_audit_log")
+}
+
+// -----------------------------------------------------------------------------
+// Guest Session & Temporary Practice Primitives (SECURITY_PRIVACY.md & PRODUCT_SPEC.md)
+// Raw token is never stored; only cryptographically secure SHA-256 tokenHash.
+// -----------------------------------------------------------------------------
+
+model GuestSession {
+  id                      String    @id @default(cuid())
+  tokenHash               String    @unique
+  expiresAt               DateTime
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+  ipAddress               String?
+  userAgent               String?
+
+  // Purpose-specific consent states for temporary guest practice
+  consentAiQuestions      Boolean   @default(false)
+  consentAiEvaluation     Boolean   @default(false)
+  consentResumeProcessing Boolean   @default(false)
+  noticeVersion           String    @default("1.0")
+
+  consentLogs             ConsentAuditLog[]
+  idempotencyKeys         IdempotencyKey[]
+  interviews              Interview[]
+  reports                 InterviewReport[]
+  usageRecords            UsageRecord[]
+
+  @@index([expiresAt])
+  @@map("guest_session")
+}
+
+// -----------------------------------------------------------------------------
+// Idempotency Safeguards (ARCHITECTURE.md, DECISIONS.md, & SECURITY_PRIVACY.md)
+// Prevents duplicate processing on quota reservation, reports, and retries.
+// -----------------------------------------------------------------------------
+
+model IdempotencyKey {
+  id             String        @id @default(cuid())
+  key            String
+  scope          String        // e.g. "quota_reservation", "report_generation", "consent_action"
+  userId         String?
+  user           User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestSessionId String?
+  guestSession   GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+
+  status         String        // "started" | "completed" | "failed"
+  responseBody   String?       // Serialized JSON result for identical replay
+  responseCode   Int?          // Response status code
+  lockedAt       DateTime      @default(now())
+  expiresAt      DateTime
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@unique([key, scope])
+  @@index([expiresAt])
+  @@index([userId])
+  @@index([guestSessionId])
+  @@map("idempotency_key")
+}
+
+// -----------------------------------------------------------------------------
+// Interview History Ownership Baseline (PRODUCT_SPEC.md & ARCHITECTURE.md)
+// Minimal foundation model to establish user ownership without premature tables.
+// -----------------------------------------------------------------------------
+
+model Interview {
+  id              String             @id @default(cuid())
+  userId          String?
+  user            User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestSessionId  String?
+  guestSession    GuestSession?      @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+
+  interviewType   String             // "technical" | "behavioral" | "resume" | "company"
+  status          String             @default("draft") // "draft" | "in_progress" | "evaluating" | "completed" | "failed"
+  role            String             // e.g. "Software Engineering Intern"
+  difficulty      String             // "easy" | "medium" | "hard"
+  durationMinutes Int                // 5 | 10 | 20
+  questionCount   Int                // e.g. 8
+  companyName     String?            // Optional target company
+  jobDescription  String?            // Optional job description/context
+  resumeText      String?            // Optional temporary extracted/pasted resume context
+  questionSource  String             // "gemini" | "fallback"
+  modelIdentifier String?            // e.g. "gemini-3.5-flash-lite" | "fallback-bank"
+  promptVersion   String?            // e.g. "1.0"
+  schemaVersion   String?            // e.g. "1.0"
+
+  startedAt       DateTime?
+  endedAt         DateTime?
+  lastPausedAt    DateTime?
+  totalPauseDurationSeconds Int     @default(0)
+  currentQuestionIndex      Int     @default(0)
+  isPracticeMode            Boolean @default(false)
+
+  questions       InterviewQuestion[]
+  answers         InterviewAnswer[]
+  report          InterviewReport?
+  usageRecords    UsageRecord[]
+
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([status])
+  @@map("interview")
+}
+
+model InterviewQuestion {
+  id               String           @id @default(cuid())
+  interviewId      String
+  interview        Interview        @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  orderIndex       Int
+  questionText     String
+  category         String?   // "technical" | "behavioral" | "resume" | "situational"
+  difficulty       String?   // "easy" | "medium" | "hard"
+  source           String    // "gemini" | "fallback"
+  timeLimitSeconds Int?
+
+  answer           InterviewAnswer?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([interviewId])
+  @@map("interview_question")
+}
+
+model InterviewAnswer {
+  id              String            @id @default(cuid())
+  interviewId     String
+  interview       Interview         @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  questionId      String            @unique
+  question        InterviewQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  transcript      String            // Confirmed final answer text
+  rawTranscript   String?           // Original recognized transcript before manual edits
+  status          String            @default("submitted") // "submitted" | "skipped" | "unanswered"
+  inputMode       String            @default("speech") // "speech" | "text" | "mixed"
+  durationSeconds Int?              // Seconds spent on this answer
+  isEdited        Boolean           @default(false)
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([interviewId])
+  @@map("interview_answer")
+}
+
+model UsageRecord {
+  id               String        @id @default(cuid())
+  userId           String?
+  user             User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestSessionId   String?
+  guestSession     GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+  interviewId      String?
+  interview        Interview?    @relation(fields: [interviewId], references: [id], onDelete: SetNull)
+
+  action           String        // "question_generation" | "evaluation"
+  status           String        // "reserved" | "committed" | "released"
+  unitsReserved    Int           @default(1)
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  model            String?
+
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("usage_record")
+}
+
+// -----------------------------------------------------------------------------
+// Interview Evaluation & Report Model (PRODUCT_SPEC.md & ARCHITECTURE.md)
+// Stores validated scores, dimension rubrics, and feedback per Milestone 7.
+// -----------------------------------------------------------------------------
+
+model InterviewReport {
+  id                    String        @id @default(cuid())
+  interviewId           String        @unique
+  interview             Interview     @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  userId                String?
+  user                  User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestSessionId        String?
+  guestSession          GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+
+  status                String        @default("pending") // "pending" | "processing" | "completed" | "failed"
+  overallScore          Int?          // 0-100
+  summary               String?       // Executive performance summary
+  scoreExplanation      String?       // Truthful contextualization of what the score represents
+  strengths             String[]      // Key candidate strengths with evidence
+  improvements          String[]      // High-priority improvement suggestions
+  primaryRecommendation String?       // One concrete personalized next step
+
+  dimensionScores       Json          // Array of DimensionEvaluation
+  questionFeedback      Json          // Array of QuestionEvaluation
+
+  modelIdentifier       String?       // e.g. "gemini-3.5-flash-lite"
+  promptVersion         String?       // e.g. "1.0"
+  rubricVersion         String?       // e.g. "1.0"
+  schemaVersion         String?       // e.g. "1.0"
+
+  evaluatedAnswersCount Int           @default(0)
+  skippedAnswersCount   Int           @default(0)
+  failureReason         String?
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([status])
+  @@map("interview_report")
+}
+
+// -----------------------------------------------------------------------------
+// Personalization Profile Model (Milestone 9 - PRODUCT_SPEC.md & DECISIONS.md)
+// Stores privacy-conscious, evidence-grounded candidate personalization profiles.
+// Purged immediately upon personalization consent withdrawal.
+// -----------------------------------------------------------------------------
+
+model PersonalizationProfile {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status               String   @default("ready") // "ready" | "insufficient_evidence" | "stale" | "failed"
+  schemaVersion        String   @default("1.0")
+
+  consentGrantedAt     DateTime
+  consentNoticeVersion String   @default("1.0")
+
+  eligibleReportCount  Int      @default(0)
+  eligibleReportIds    String[]
+
+  compiledAt           DateTime @default(now())
+  lastRefreshedAt      DateTime @default(now())
+
+  profileData          Json
+  failureReason        String?
+
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@map("personalization_profile")
+}
+
+
